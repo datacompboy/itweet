@@ -77,6 +77,9 @@
 %% EXPORTS
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
+%% For development
+-compile(export_all).
+
 %% BEHAVIOUR
 -export([behaviour_info/1]).
 %% API
@@ -93,8 +96,9 @@
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 -record(state, {module                      :: atom(), % Callback module
                 mod_state                   :: term(), % Callback module state
-                user                        :: string(),
-                password                    :: string(),
+                access_token                :: string(),
+                access_token_secret         :: string(),
+                consumer																				:: tuple(),
                 req_id                      :: undefined | ibrowse:req_id(),
                 buffer                      :: binary(),
                 http_status                 :: string(),
@@ -125,26 +129,27 @@ behaviour_info(_Other) ->
 %%% @doc  Starts a generic server.
 -spec start(Mod::atom(), Args::term(), Options::[start_option()]) -> start_result().
 start(Mod, Args, Options) ->
-  {User, Password, StreamTimeout, OtherOptions} = parse_start_options(Options),
-  gen_server:start(?MODULE, {Mod, Args, User, Password, StreamTimeout}, OtherOptions).
+  {ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout, OtherOptions} = parse_start_options(Options),
+  gen_server:start(?MODULE, 
+                   {Mod, Args, ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout}, OtherOptions).
 
 %%% @doc  Starts a named generic server.
 -spec start(Name::{local|global, atom()}, Mod::atom(), Args::term(), Options::[start_option()]) -> start_result().
 start(Name, Mod, Args, Options) ->
-  {User, Password, StreamTimeout, OtherOptions} = parse_start_options(Options),
-  gen_server:start(Name, ?MODULE, {Mod, Args, User, Password, StreamTimeout}, OtherOptions).
+  {ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout, OtherOptions} = parse_start_options(Options),
+  gen_server:start(Name, ?MODULE, {Mod, Args, ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout}, OtherOptions).
 
 %%% @doc  Starts and links a generic server.
 -spec start_link(Mod::atom(), Args::term(), Options::[start_option()]) -> start_result().
 start_link(Mod, Args, Options) ->
-  {User, Password, StreamTimeout, OtherOptions} = parse_start_options(Options),
-  gen_server:start_link(?MODULE, {Mod, Args, User, Password, StreamTimeout}, OtherOptions).
+  {ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout, OtherOptions} = parse_start_options(Options),
+  gen_server:start_link(?MODULE, {Mod, Args, ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout}, OtherOptions).
 
 %%% @doc  Starts and links a named generic server.
 -spec start_link(Name::{local|global, atom()}, Mod::atom(), Args::term(), Options::[start_option()]) -> start_result().
 start_link(Name, Mod, Args, Options) ->
-  {User, Password, StreamTimeout, OtherOptions} = parse_start_options(Options),
-  gen_server:start_link(Name, ?MODULE, {Mod, Args, User, Password, StreamTimeout}, OtherOptions).
+  {ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout, OtherOptions} = parse_start_options(Options),
+  gen_server:start_link(Name, ?MODULE, {Mod, Args, ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout}, OtherOptions).
 
 %%% @doc  Starts using the <a href="http://dev.twitter.com/pages/streaming_api_methods#statuses-filter">statuses/filter</a> method to get results
 -spec filter(server(), [filter_option() | ibrowse:option()]) -> ok.
@@ -202,14 +207,15 @@ current_method(Server) ->
 
 %% @hidden
 -spec init({atom(), term(), string(), string(), pos_integer()}) -> {ok, state()} | ignore | {stop, term()}.
-init({Mod, InitArgs, User, Password, StreamTimeout}) ->
+init({Mod, InitArgs, ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout}) ->
   _Seed = random:seed(erlang:now()),
   case Mod:init(InitArgs) of
     {ok, ModState} ->
       {ok, #state{module        = Mod,
                   mod_state     = ModState,
-                  user          = User,
-                  password      = Password,
+                  access_token  = AccessToken,
+                  access_token_secret = AccessTokenSecret,
+                  consumer = {ConsumerKey, ConsumerSecret, hmac_sha1},
                   stream_timeout= StreamTimeout}};
     Other ->
       Other
@@ -247,14 +253,24 @@ handle_call({call, Request}, From, State = #state{module = Mod, mod_state = ModS
 
 %% @hidden
 -spec handle_cast(rest | wait | {string(), [filter_option() | gen_option() | ibrowse:option()]}, state()) -> {noreply, state(), pos_integer() | infinity} | {stop, term(), state()}.
-handle_cast(M = {Method, Options}, State = #state{user = User, password = Password, req_id = OldReqId, reconnect_timer = Timer}) ->
-  BasicUrl = ["https://stream.twitter.com/1/statuses/", Method, ".json"],
+handle_cast(M = {Method, Options}, State = #state{access_token = AccessToken, 
+                                                  access_token_secret = AccessTokenSecret,
+                                                  consumer = Consumer,
+                                                  req_id = OldReqId, reconnect_timer = Timer}) ->
+  BasicUrl = lists:flatten(["https://stream.twitter.com/1/statuses/", Method, ".json"]),
   {Url, IOptions} = build_url(BasicUrl, Options),
+  error_logger:info_msg("build_url:~p~n", [Url]),
+  %% oauth-related change
+  {_Protocol, _Host, _Path, QS, _} = mochiweb_util:urlsplit(Url),
+  QueryParams = mochiweb_util:parse_qs(QS),
+
+  SignedParams = oauth:sign("GET", BasicUrl, QueryParams, Consumer, AccessToken, AccessTokenSecret),
+  SignedUrl = oauth:uri(BasicUrl, SignedParams),
   case Timer of
     undefined -> ok;
     Timer -> _ = erlang:cancel_timer(Timer), ok
   end,
-  case connect(Url, IOptions, User, Password) of
+  case connect(SignedUrl, IOptions) of
     {ok, ReqId} ->
       stream_close(OldReqId),
       NewState = State#state{req_id = ReqId, method = M, reconnect_timer = undefined,
@@ -406,7 +422,7 @@ handle_info({reconnect, Method}, State = #state{method = wait}) ->
   error_logger:info_msg("~p, ~p - ~p: Reconnecting...~n", [self(), calendar:local_time(), ?MODULE]),
   handle_cast(Method, State#state{reconnect_timer = undefined});
 handle_info({reconnect, _Method}, State) -> %% It's no longer waiting
-  error_logger:info_msg("~p, ~p - ~p: Already econnected...~n", [self(), calendar:local_time(), ?MODULE]),
+  error_logger:info_msg("~p, ~p - ~p: Already reconnected...~n", [self(), calendar:local_time(), ?MODULE]),
   {noreply, State, timeout(State)};
 %% OTHERs ------------------------------------------------------------------------------------------
 handle_info(Info, State = #state{module = Mod, mod_state = ModState}) ->
@@ -429,19 +445,32 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% PRIVATE FUNCTIONS
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 parse_start_options(Options) ->
-  User = case proplists:get_value(user, Options) of
-           undefined -> throw({missing_option, user});
+  ConsumerKey = case proplists:get_value(consumer_key, Options) of
+           undefined -> throw({missing_option, consumer_key});
            U -> U
          end,
-  Password = case proplists:get_value(password, Options) of
-               undefined -> throw({missing_option, password});
+  ConsumerSecret = case proplists:get_value(consumer_secret, Options) of
+               undefined -> throw({missing_option, consumer_secret});
                P -> P
              end,
+  AccessToken = case proplists:get_value(access_token, Options) of
+           undefined -> throw({missing_option, access_token});
+           AT -> AT
+         end,
+  AccessTokenSecret = case proplists:get_value(access_token_secret, Options) of
+           undefined -> throw({missing_option, access_token_secret});
+           ATS -> ATS
+         end,
+
   StreamTimeout = case proplists:get_value(stream_timeout, Options) of
                     undefined -> 90000;
                     ST -> ST
                   end, 
-  {User, Password, StreamTimeout, proplists:delete(user, proplists:delete(password, Options))}.
+  {ConsumerKey, ConsumerSecret, AccessToken, AccessTokenSecret, StreamTimeout, 
+   	proplists:delete(access_token_secret, 
+                     proplists:delete(access_token, 
+                                      proplists:delete(consumer_secret,
+                                                       proplists:delete(consumer_key, Options))))}.
 
 build_url(BasicUrl, Options) ->
   build_url(Options, $?, BasicUrl, []).
@@ -524,8 +553,8 @@ extract_jsons([Next | Rest], Acc) ->
   Json = itweet_mochijson2:decode(Next),
   extract_jsons(Rest, [Json | Acc]).
 
-connect(Url, IOptions, User, Password) ->
-  try ibrowse:send_req(Url, [], get, [], [{basic_auth, {User, Password}},
+connect(Url, IOptions) ->
+  try ibrowse:send_req(Url, [], get, [], [
                                           {stream_to, {self(), once}},
                                           {response_format, binary} | IOptions], infinity) of
     {ibrowse_req_id, ReqId} ->
